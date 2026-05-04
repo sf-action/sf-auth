@@ -1,0 +1,276 @@
+name: Salesforce Authentication
+description: Installs SF CLI and authenticates to Salesforce via JWT or SFDX auth URL
+
+branding:
+  icon: cloud
+  color: blue
+
+inputs:
+  auth-method:
+    description: Authentication method — 'jwt' (default) or 'auth-url'
+    required: false
+    default: jwt
+  consumer-key:
+    description: Consumer key from your Connected App or External Client App (required for JWT auth)
+    required: false
+  jwt-private-key:
+    description: JWT private key contents (required for JWT auth)
+    required: false
+  username:
+    description: Salesforce username (required for JWT auth)
+    required: false
+  instance-url:
+    description: Salesforce instance URL (e.g. https://test.salesforce.com, https://login.salesforce.com, or a custom domain)
+    required: false
+    default: https://test.salesforce.com
+  sfdx-auth-url:
+    description: Salesforce auth URL (force://clientId:clientSecret:refreshToken@instanceUrl) — required for auth-url method
+    required: false
+  sf-cli-version:
+    description: Salesforce CLI version to install (e.g. 2.50.6 or latest)
+    required: false
+    default: latest
+  org-alias:
+    description: Alias to assign to the authenticated org
+    required: false
+    default: myorg
+  get-org-info:
+    description: Retrieve org details (org-id, type, my-domain-url, release-version). Adds an extra SOQL query.
+    required: false
+    default: 'false'
+  plugins:
+    description: Comma-separated list of SF CLI plugins to install (e.g. sfdx-git-delta,@salesforce/sfdx-scanner)
+    required: false
+    default: ''
+  debug:
+    description: Set to 'true' to print all command output — useful for troubleshooting authentication issues.
+    required: false
+    default: 'false'
+
+outputs:
+  org-alias:
+    description: Alias assigned to the authenticated org
+    value: ${{ steps.set-alias.outputs.alias }}
+  org-id:
+    description: Salesforce org ID
+    value: ${{ steps.org-details.outputs.org-id }}
+  type:
+    description: Org type (Production, Sandbox, or Scratch)
+    value: ${{ steps.org-details.outputs.type }}
+  my-domain-url:
+    description: Resolved My Domain URL of the authenticated org
+    value: ${{ steps.org-details.outputs.my-domain-url }}
+  release-version:
+    description: Salesforce internal release number (e.g. 260, 262, 264)
+    value: ${{ steps.org-details.outputs.release-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.auth-method }}" == "jwt" ]]; then
+          if [[ -z "${{ inputs.consumer-key }}" || -z "${{ inputs.jwt-private-key }}" || -z "${{ inputs.username }}" ]]; then
+            echo "Error: consumer-key, jwt-private-key, and username are required for JWT auth"
+            exit 1
+          fi
+          if [[ ! "${{ inputs.instance-url }}" =~ ^https:// ]]; then
+            echo "Error: instance-url must start with https://"
+            exit 1
+          fi
+        elif [[ "${{ inputs.auth-method }}" == "auth-url" ]]; then
+          if [[ -z "${{ inputs.sfdx-auth-url }}" ]]; then
+            echo "Error: sfdx-auth-url is required for auth-url method"
+            exit 1
+          fi
+        else
+          echo "Error: auth-method must be 'jwt' or 'auth-url'"
+          exit 1
+        fi
+
+    - name: Mask secrets
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.auth-method }}" == "jwt" ]]; then
+          echo "::add-mask::${{ inputs.jwt-private-key }}"
+        else
+          echo "::add-mask::${{ inputs.sfdx-auth-url }}"
+        fi
+
+    - name: Set weekly cache suffix for latest version
+      id: cache-suffix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.sf-cli-version }}" == "latest" ]]; then
+          echo "suffix=$(date +%Y-W%V)" >> $GITHUB_OUTPUT
+        else
+          echo "suffix=${{ inputs.sf-cli-version }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set npm global prefix path
+      id: npm-prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          npm config set prefix "$USERPROFILE\\.npm-global"
+        else
+          npm config set prefix "$HOME/.npm-global"
+        fi
+        # Read back the canonical path npm resolved to
+        CANONICAL=$(npm config get prefix)
+        echo "path=$CANONICAL" >> $GITHUB_OUTPUT
+        echo "NPM_PREFIX=$CANONICAL" >> $GITHUB_ENV
+
+    - name: Cache Salesforce CLI
+      id: cache-sf-cli
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.npm-prefix.outputs.path }}
+        key: sf-cli-${{ runner.os }}-${{ steps.cache-suffix.outputs.suffix }}
+
+    - name: Install Salesforce CLI
+      if: steps.cache-sf-cli.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.debug }}" == "true" ]]; then
+          npm install --global @salesforce/cli@${{ inputs.sf-cli-version }}
+        else
+          npm install --global @salesforce/cli@${{ inputs.sf-cli-version }} > /dev/null 2>&1
+        fi
+
+    - name: Add SF CLI to PATH
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          echo "$NPM_PREFIX" >> $GITHUB_PATH
+        else
+          echo "$NPM_PREFIX/bin" >> $GITHUB_PATH
+        fi
+
+    - name: Verify SF CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        sf --version
+
+    - name: Install SF CLI plugins
+      if: inputs.plugins != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        IFS=',' read -ra PLUGINS <<< "${{ inputs.plugins }}"
+        for plugin in "${PLUGINS[@]}"; do
+          plugin=$(echo "$plugin" | xargs)
+          echo "Installing plugin: $plugin"
+          if [[ "${{ inputs.debug }}" == "true" ]]; then
+            sf plugins install "$plugin" <<< "y"
+          else
+            sf plugins install "$plugin" <<< "y" > /dev/null 2>&1
+          fi
+        done
+
+    - name: Write JWT private key
+      if: inputs.auth-method == 'jwt'
+      shell: bash
+      env:
+        JWT_KEY: ${{ inputs.jwt-private-key }}
+      run: |
+        set -euo pipefail
+        echo "$JWT_KEY" > "$RUNNER_TEMP/server.key"
+        if [[ "$RUNNER_OS" != "Windows" ]]; then
+          chmod 600 "$RUNNER_TEMP/server.key"
+        fi
+
+    - name: Authenticate via JWT
+      if: inputs.auth-method == 'jwt'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.debug }}" == "true" ]]; then
+          sf org login jwt \
+            --client-id "${{ inputs.consumer-key }}" \
+            --jwt-key-file "$RUNNER_TEMP/server.key" \
+            --username "${{ inputs.username }}" \
+            --instance-url "${{ inputs.instance-url }}" \
+            --alias "${{ inputs.org-alias }}" \
+            --set-default
+        else
+          sf org login jwt \
+            --client-id "${{ inputs.consumer-key }}" \
+            --jwt-key-file "$RUNNER_TEMP/server.key" \
+            --username "${{ inputs.username }}" \
+            --instance-url "${{ inputs.instance-url }}" \
+            --alias "${{ inputs.org-alias }}" \
+            --set-default \
+            > /dev/null 2>&1
+        fi
+
+    - name: Authenticate via SFDX auth URL
+      if: inputs.auth-method == 'auth-url'
+      shell: bash
+      env:
+        SFDX_AUTH_URL: ${{ inputs.sfdx-auth-url }}
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.debug }}" == "true" ]]; then
+          echo "$SFDX_AUTH_URL" | sf org login sfdx-url \
+            --sfdx-url-stdin - \
+            --alias "${{ inputs.org-alias }}" \
+            --set-default
+        else
+          echo "$SFDX_AUTH_URL" | sf org login sfdx-url \
+            --sfdx-url-stdin - \
+            --alias "${{ inputs.org-alias }}" \
+            --set-default \
+            > /dev/null 2>&1
+        fi
+
+    - name: Set alias output
+      id: set-alias
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "alias=${{ inputs.org-alias }}" >> $GITHUB_OUTPUT
+
+    - name: Retrieve org details
+      id: org-details
+      if: inputs.get-org-info == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        DETAILS=$(sf org display --target-org "${{ inputs.org-alias }}" --json)
+        ACCESS_TOKEN=$(echo "$DETAILS" | jq -r '.result.accessToken // empty')
+        [ -n "$ACCESS_TOKEN" ] && echo "::add-mask::$ACCESS_TOKEN"
+        ORG_ID=$(echo "$DETAILS" | jq -r '.result.id')
+        API_VERSION=$(echo "$DETAILS" | jq -r '.result.apiVersion' | cut -d'.' -f1)
+        [ -z "$API_VERSION" ] && echo "Error: could not read apiVersion" && exit 1
+        RELEASE_VERSION=$(( (API_VERSION - 66) * 2 + 260 ))
+        MY_DOMAIN_URL=$(echo "$DETAILS" | jq -r '.result.instanceUrl')
+        ORG_QUERY=$(sf data query --query "SELECT IsSandbox, TrialExpirationDate FROM Organization" --target-org "${{ inputs.org-alias }}" --json)
+        IS_SANDBOX=$(echo "$ORG_QUERY" | jq -r '.result.records[0].IsSandbox')
+        TRIAL_EXPIRY=$(echo "$ORG_QUERY" | jq -r '.result.records[0].TrialExpirationDate // empty')
+        if [ -n "$TRIAL_EXPIRY" ]; then
+          TYPE="Scratch"
+        elif [ "$IS_SANDBOX" = "true" ]; then
+          TYPE="Sandbox"
+        else
+          TYPE="Production"
+        fi
+        echo "::add-mask::$ORG_ID"
+        echo "::add-mask::$MY_DOMAIN_URL"
+        echo "org-id=$ORG_ID" >> $GITHUB_OUTPUT
+        echo "my-domain-url=$MY_DOMAIN_URL" >> $GITHUB_OUTPUT
+        echo "type=$TYPE" >> $GITHUB_OUTPUT
+        echo "release-version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Remove private key
+      shell: bash
+      if: always()
+      run: rm -f "$RUNNER_TEMP/server.key"
