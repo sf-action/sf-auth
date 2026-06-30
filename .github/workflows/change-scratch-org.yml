@@ -22,6 +22,7 @@ jobs:
           username: ${{ secrets.SF_USERNAME_PROD }}
           instance-url: https://login.salesforce.com
           org-alias: devhub
+          sf-cli-version: nightly
 
       - name: Auth to existing scratch org
         uses: ./
@@ -30,6 +31,7 @@ jobs:
           jwt-private-key: ${{ secrets.SF_JWT_PRIVATE_KEY_SANDBOX }}
           username: ${{ secrets.SF_USERNAME_SANDBOX }}
           org-alias: old-scratch
+          sf-cli-version: nightly
 
       - name: Retrieve ECA from existing scratch org
         run: |
